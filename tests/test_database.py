@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 
+from pgdesk.browsing import BrowsePlan
 from pgdesk.config import Cluster, Config
 from pgdesk.database import DatabaseSession, QueryCancelled
 
@@ -141,7 +145,7 @@ def test_catalog_preserves_empty_schemas_views_and_quoted_names(session: Databas
     assert table.columns[1].not_null
     assert "PRIMARY KEY" in table.constraints
     assert next(r for r in catalog.relations if r.name == "sample_view").is_view
-    assert session.execute(table.preview_sql()).columns == ("key", "value")
+    assert session.preview(BrowsePlan.sample(table), 5).result.columns == ("key", "value")
 
 
 @pytest.mark.parametrize(
@@ -204,3 +208,86 @@ def test_overlapping_shutdown_waits_for_pool_even_if_one_caller_is_cancelled(
             await asyncio.to_thread(workspace.session.close)
 
     asyncio.run(scenario())
+
+
+def test_timestamp_browsing_preserves_latest_rows_nulls_and_heavy_values(
+    session: DatabaseSession,
+) -> None:
+    """Timestamp ties use UUID tie-breakers; light values stay narrow and heavy values stay complete."""
+    session.config = replace(session.config, row_limit=200)
+    session.execute(
+        "CREATE TABLE dated(id uuid PRIMARY KEY, created_at timestamptz, label text, payload jsonb)",
+        read_only=False,
+    )
+    session.execute(
+        "INSERT INTO dated SELECT md5(n::text)::uuid, "
+        "CASE WHEN n % 31 = 0 THEN NULL ELSE timestamptz '2024-01-01 00:00:00+00' + (n / 2) * interval '1 second' END, "
+        "CASE WHEN n = 240 THEN repeat('a',1000) ELSE 'row '||n END, "
+        "CASE WHEN n % 7 = 0 THEN NULL ELSE jsonb_build_object('text',repeat('x',10000)) END "
+        "FROM generate_series(1,240) n",
+        read_only=False,
+    )
+    session.execute("CREATE INDEX ON dated(created_at DESC NULLS LAST, id DESC)", read_only=False)
+    session.execute("ANALYZE dated", read_only=False)
+    relation = next(r for r in session.catalog().relations if r.name == "dated")
+    with pytest.raises(ValueError):
+        BrowsePlan.from_sql(relation, "SELECT id FROM public.dated ORDER BY id DESC LIMIT 100")
+    plan = BrowsePlan.from_sql(
+        relation,
+        "SELECT id, created_at, label, payload FROM public.dated ORDER BY created_at DESC, id DESC LIMIT 100",
+    )
+    light = session.preview(plan, 5)
+    heavy = session.preview(plan, 100, heavy=True)
+    expected = sorted(
+        (
+            datetime(2024, 1, 1, tzinfo=UTC) + timedelta(seconds=n // 2),
+            uuid.UUID(hashlib.md5(str(n).encode(), usedforsecurity=False).hexdigest()),
+            n,
+        )
+        for n in range(1, 241)
+        if n % 31
+    )[::-1]
+    assert light.ordered and heavy.ordered
+    assert [(row[1], row[0]) for row in light.result.rows] == [
+        (at, key) for at, key, _ in expected[:5]
+    ]
+    assert [(row[1], row[0]) for row in heavy.result.rows] == [
+        (at, key) for at, key, _ in expected[:100]
+    ]
+    assert light.result.columns[-1] == "payload__is_null"
+    assert [row[3] for row in light.result.rows] == [n % 7 == 0 for _, _, n in expected[:5]]
+    assert len(light.result.rows[0][2]) == 160
+    assert len(heavy.result.rows[0][2]) == 1000
+    assert heavy.result.rows[0][3] == {"text": "x" * 10000}
+
+
+def test_expensive_latest_sort_becomes_an_explicit_unordered_sample(
+    session: DatabaseSession,
+) -> None:
+    """A large unindexed order cannot masquerade as a cheap latest-row preview."""
+    session.config = replace(session.config, row_limit=200)
+    session.execute(
+        "CREATE TABLE heap AS SELECT n AS id FROM generate_series(1,100000) n", read_only=False
+    )
+    session.execute("ANALYZE heap", read_only=False)
+    relation = next(r for r in session.catalog().relations if r.name == "heap")
+    plan = BrowsePlan.from_sql(relation, "SELECT id FROM public.heap ORDER BY id DESC LIMIT 100")
+    sample = session.preview(plan, 5)
+    assert not sample.ordered
+    assert len(sample.result.rows) == 5
+    assert session.execute(sample.statement).rows == sample.result.rows
+    assert sample.result.rows != tuple((n,) for n in range(100000, 99995, -1))
+
+
+def test_preview_lock_deadline_releases_its_borrower(session: DatabaseSession) -> None:
+    """Automatic table inspection must not wait indefinitely behind DDL or poison the next run."""
+    session.execute("CREATE TABLE locked(id integer PRIMARY KEY)", read_only=False)
+    relation = next(r for r in session.catalog().relations if r.name == "locked")
+    plan = BrowsePlan.from_sql(relation, "SELECT id FROM public.locked ORDER BY id DESC LIMIT 5")
+    with session.pool.connection() as blocker, blocker.transaction():
+        blocker.execute("LOCK TABLE locked IN ACCESS EXCLUSIVE MODE")
+        with ThreadPoolExecutor() as workers:
+            future = workers.submit(session.preview, plan, 5)
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                future.result(timeout=5)
+    assert session.execute("SELECT 17").rows == ((17,),)

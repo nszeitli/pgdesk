@@ -121,7 +121,7 @@ def test_concurrent_first_requests_leave_no_unowned_http_clients(monkeypatch) ->
                             "content": [
                                 {
                                     "type": "output_text",
-                                    "text": "```sql\nSELECT 1;\n```",
+                                    "text": "SELECT 1;",
                                     "annotations": [],
                                 }
                             ],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 
@@ -13,8 +14,10 @@ from textual.content import Content
 from textual.widgets import Footer, Header, Input, Static, TabbedContent, TabPane, TextArea, Tree
 
 from pgdesk.ai import SqlAssistant
+from pgdesk.browsing import BrowsePlanner
 from pgdesk.config import Config, Settings, load_config, load_settings, save_settings
 from pgdesk.screens import ConfirmScreen, ConnectScreen, HelpScreen, SettingsScreen
+from pgdesk.themes import THEME_NAMES, build_theme
 from pgdesk.workspace import Workspace
 
 
@@ -25,13 +28,19 @@ class PgDesk(App):
     SUB_TITLE = "PostgreSQL workspaces"
     ENABLE_COMMAND_PALETTE = False
     CSS = """
-    Screen { background: #0b1020; }
-    Header { background: #15233b; }
-    #pool-status { height: 2; padding: 0 1; background: #142036; }
+    Screen { background: $background; color: $foreground; }
+    Header { background: $header_bg; color: $header_fg; }
+    #pool-status { height: 2; padding: 0 1; background: $panel; color: $foreground; }
     #workspaces { height: 1fr; }
     TabPane { padding: 0; }
     #welcome { height: 1fr; padding: 2 4; content-align: center middle; }
-    Footer { background: #15233b; }
+    Footer { background: $header_bg; color: $header_fg; }
+    Input { background: $input_bg; border: tall $input_border; }
+    DataTable { background: $surface; }
+    DataTable > .datatable--header { background: $header_bg; color: $header_fg; }
+    DataTable > .datatable--odd-row { background: $odd_row_bg; }
+    DataTable > .datatable--cursor { background: $cursor_bg; color: $foreground; }
+    Tree > .tree--cursor { background: $cursor_bg; color: $foreground; }
     """
     BINDINGS: ClassVar = [
         Binding("ctrl+n", "connect", "Connect", priority=True),
@@ -48,7 +57,9 @@ class PgDesk(App):
         Binding("f8", "toggle_writes", "Read/write", show=False, priority=True),
         Binding("f9", "settings", "Settings", priority=True),
         Binding("ctrl+b", "sidebar", "Tree", show=False, priority=True),
-        Binding("ctrl+l", "load_ai", "Load AI SQL", show=False, priority=True),
+        Binding("ctrl+l", "light_preview", "Light 100", priority=True),
+        Binding("ctrl+g", "heavy_preview", "Heavy 100", priority=True),
+        Binding("ctrl+d", "duplicate_tab", "Duplicate", show=False, priority=True),
         Binding("ctrl+k", "clear_ai", "Clear AI", show=False, priority=True),
         Binding("ctrl+s", "export", "CSV", priority=True),
         Binding("ctrl+q", "request_quit", "Quit", priority=True),
@@ -67,9 +78,13 @@ class PgDesk(App):
         self.config = config
         self.config_path = config_path
         self.settings = settings or load_settings(config.settings_path)
+        for name in THEME_NAMES:
+            self.register_theme(build_theme(name))
+        self.theme = self.settings.theme
         self.assistant = assistant or SqlAssistant(
             secret=config.openai_secret, key_path=config.openai_key_path
         )
+        self.browsing = BrowsePlanner(self.assistant)
         self.workspaces: dict[str, Workspace] = {}
         self.serial = 0
         self.quitting = False
@@ -89,7 +104,6 @@ class PgDesk(App):
 
     def on_mount(self) -> None:
         """Start a cheap status redraw, with all health I/O owned by pool threads."""
-        self.theme = "textual-dark"
         self.query_one("#workspaces").display = False
         self.set_interval(1, self.refresh_status)
 
@@ -126,7 +140,9 @@ class PgDesk(App):
     def action_connect(self) -> None:
         """Reload configuration before opening the searchable cluster/database chooser."""
         try:
-            self.config = load_config(self.config_path)
+            self.config = replace(
+                load_config(self.config_path), settings_path=self.config.settings_path
+            )
         except (ValueError, TypeError, OSError) as error:
             self.notify(
                 f"Configuration invalid: {type(error).__name__}. Check {self.config_path}.",
@@ -141,7 +157,7 @@ class PgDesk(App):
             await self.open_workspace(*pair)
 
     async def open_workspace(self, cluster, database: str) -> Workspace:
-        """Focus an existing pair or mount its sole pool-owning workspace."""
+        """Focus an existing pair or mount a pool-owning workspace; duplicates are explicit."""
         tabs = self.query_one("#workspaces", TabbedContent)
         for tab_id, workspace in self.workspaces.items():
             if workspace.cluster.name == cluster.name and workspace.database == database:
@@ -149,11 +165,28 @@ class PgDesk(App):
                 tabs.active = tab_id
                 workspace.query_one("#schema-tree", Tree).focus()
                 return workspace
+        return await self._mount_workspace(cluster, database)
+
+    async def duplicate_workspace(self, source: Workspace) -> Workspace:
+        """Fork the selected table and SQL into an independent, initially read-only workspace."""
+        return await self._mount_workspace(source.cluster, source.database, source=source)
+
+    async def _mount_workspace(
+        self, cluster, database: str, *, source: Workspace | None = None
+    ) -> Workspace:
+        """Own mounting/cleanup for both chooser-created and deliberately duplicated tabs."""
+        tabs = self.query_one("#workspaces", TabbedContent)
         self.serial += 1
         tab_id = f"db-{self.serial}"
-        workspace = Workspace(cluster, database, self.config, self.assistant)
+        workspace = Workspace(
+            cluster, database, source.config if source else self.config, self.assistant
+        )
         pane = TabPane(
-            Content(f"{cluster.name}/{database}" + (" [PROD]" if cluster.production else "")),
+            Content(
+                f"{cluster.name}/{database}"
+                + (" [PROD]" if cluster.production else "")
+                + (f" · copy {self.serial}" if source else "")
+            ),
             workspace,
             id=tab_id,
         )
@@ -167,7 +200,11 @@ class PgDesk(App):
             await asyncio.to_thread(workspace.session.close)
             raise
         tabs.active = tab_id
-        workspace.query_one("#schema-tree", Tree).focus()
+        if source:
+            workspace.copy_from(source)
+            workspace.query_one("#sql-editor", TextArea).focus()
+        else:
+            workspace.query_one("#schema-tree", Tree).focus()
         self.refresh_status()
         return workspace
 
@@ -212,7 +249,7 @@ class PgDesk(App):
         self.refresh_status()
 
     def action_panel(self, name: str) -> None:
-        """Toggle one right-hand pane in the active workspace."""
+        """Show/focus one panel, or hide it when its primary widget already has focus."""
         if workspace := self.active_workspace:
             workspace.toggle_panel(name)
 
@@ -235,17 +272,27 @@ class PgDesk(App):
     def action_refresh_schema(self) -> None:
         """Refresh the active tab's tree and AI metadata snapshot."""
         if workspace := self.active_workspace:
-            workspace.refresh_catalog()
+            workspace.refresh_catalog(replan=True)
 
     def action_toggle_writes(self) -> None:
         """Use the tab's explicit write-mode confirmation path."""
         if workspace := self.active_workspace:
             workspace.toggle_writes()
 
-    def action_load_ai(self) -> None:
-        """Load an AI draft into the editor without executing it."""
+    def action_light_preview(self) -> None:
+        """Refresh the selected relation with a narrow hundred-row read."""
         if workspace := self.active_workspace:
-            workspace.load_ai()
+            workspace.browse(limit=100)
+
+    def action_heavy_preview(self) -> None:
+        """Refresh the selected relation with all columns and a hundred-row cap."""
+        if workspace := self.active_workspace:
+            workspace.browse(limit=100, heavy=True)
+
+    async def action_duplicate_tab(self) -> None:
+        """Create a separate editable workspace without executing the copied SQL."""
+        if workspace := self.active_workspace:
+            await self.duplicate_workspace(workspace)
 
     def action_clear_ai(self) -> None:
         """Forget only the active workspace's in-memory AI conversation."""
@@ -274,7 +321,10 @@ class PgDesk(App):
             )
             return
         self.settings = settings
-        self.notify("AI settings saved")
+        self.theme = settings.theme
+        for workspace in self.workspaces.values():
+            workspace.apply_theme()
+        self.notify("Settings saved")
 
     def action_help(self) -> None:
         """Show the complete keyboard and execution contract reference."""
@@ -301,12 +351,14 @@ class PgDesk(App):
         """Await every workspace and the AI transport before ending the terminal session."""
         self.quitting = True
         await asyncio.gather(*(workspace.shutdown() for workspace in self.workspaces.values()))
+        await self.browsing.close()
         await self.assistant.close()
         self.exit()
 
     async def on_unmount(self) -> None:
         """Also release resources on framework exit, interrupt or an unhandled UI error."""
         await asyncio.gather(*(workspace.shutdown() for workspace in self.workspaces.values()))
+        await self.browsing.close()
         await self.assistant.close()
 
     async def on_key(self, event: events.Key) -> None:

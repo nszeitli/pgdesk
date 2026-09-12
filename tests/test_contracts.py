@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 import pgdesk.__main__ as entrypoint
-from pgdesk.catalog import QueryResult, Relation
+from pgdesk.browsing import BrowsePlan
+from pgdesk.catalog import Column, QueryResult, Relation
 from pgdesk.config import Settings, load_config, load_settings, save_settings
 
 
@@ -102,8 +103,13 @@ def test_quoted_relation_preview_is_one_statement() -> None:
     """Unusual database identifiers must remain identifiers rather than executable text."""
     from pglast import parse_sql
 
-    relation = Relation('schema"odd', 'table"; DROP TABLE victim;--', "r", ())
-    parsed = parse_sql(relation.preview_sql())
+    relation = Relation(
+        'schema"odd',
+        'table"; DROP TABLE victim;--',
+        "r",
+        (Column('id"odd', "integer", True, None),),
+    )
+    parsed = parse_sql(BrowsePlan.sample(relation).sql(5))
     assert len(parsed) == 1
     source = parsed[0].stmt.fromClause[0]
     assert source.schemaname == relation.schema

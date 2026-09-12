@@ -14,7 +14,22 @@ from pglast import ast, parse_sql
 from pglast.parser import ParseError
 from psycopg_pool import ConnectionPool
 
-from pgdesk.catalog import CATALOG_SQL, SCHEMAS_SQL, Catalog, QueryResult, build_catalog, cell_text
+from pgdesk.browsing import (
+    PREVIEW_LOCK_TIMEOUT_MS,
+    PREVIEW_TIMEOUT_MS,
+    BrowsePlan,
+    PreviewResult,
+    inexpensive_plan,
+)
+from pgdesk.catalog import (
+    CATALOG_SQL,
+    INDEXES_SQL,
+    SCHEMAS_SQL,
+    Catalog,
+    QueryResult,
+    build_catalog,
+    cell_text,
+)
 from pgdesk.config import Cluster, Config
 
 
@@ -163,7 +178,8 @@ class DatabaseSession:
             conn.execute("SET TRANSACTION READ ONLY")
             schemas = conn.execute(SCHEMAS_SQL).fetchall()
             rows = conn.execute(CATALOG_SQL).fetchall()
-        return build_catalog(schemas, rows)
+            indexes = conn.execute(INDEXES_SQL).fetchall()
+        return build_catalog(schemas, rows, indexes)
 
     @contextmanager
     def _execution(self) -> Iterator[psycopg.Connection]:
@@ -202,19 +218,64 @@ class DatabaseSession:
         started = time.monotonic()
         with self._execution() as conn, conn.transaction():
             conn.execute("SET TRANSACTION READ ONLY" if read_only else "SET TRANSACTION READ WRITE")
-            with self._state_lock:
-                self._sent += len(statement.encode("utf-8"))
-            with conn.cursor() as cursor:
-                cursor.execute(statement, prepare=False)
-                columns = tuple(column.name for column in cursor.description or ())
-                rows = cursor.fetchmany(self.config.row_limit + 1) if cursor.description else []
-                truncated = len(rows) > self.config.row_limit
-                if truncated:
-                    rows.pop()
-                status = cursor.statusmessage or "Statement completed"
-            if self._cancel.is_set():
-                raise QueryCancelled("Query cancelled; transaction rolled back")
-        result = QueryResult(columns, tuple(rows), status, time.monotonic() - started, truncated)
+            captured = self._fetch(conn, statement)
+        return self._finish(captured, started)
+
+    def preview(self, plan: BrowsePlan, limit: int, heavy: bool = False) -> PreviewResult:
+        """Execute an inexpensive readonly browse, explicitly falling back to an unordered sample."""
+        if plan.relation.kind not in {"r", "p", "m"}:
+            raise ValueError(
+                "Views and foreign tables require an explicit F5 query; automatic cost is not bounded"
+            )
+        started = time.monotonic()
+        ordered = bool(plan.order)
+        statement = plan.sql(limit, heavy, ordered=ordered)
+        with self._execution() as conn, conn.transaction():
+            conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)", (str(PREVIEW_TIMEOUT_MS),)
+            )
+            conn.execute(
+                "SELECT set_config('lock_timeout', %s, true)", (str(PREVIEW_LOCK_TIMEOUT_MS),)
+            )
+            query_plan = conn.execute("EXPLAIN (FORMAT JSON) " + statement).fetchone()[0][0]["Plan"]
+            if ordered and not inexpensive_plan(query_plan, ordered=True):
+                ordered = False
+                statement = plan.sql(limit, heavy, ordered=False)
+                if self._cancel.is_set():
+                    raise QueryCancelled("Preview cancelled before sample planning")
+                query_plan = conn.execute("EXPLAIN (FORMAT JSON) " + statement).fetchone()[0][0][
+                    "Plan"
+                ]
+            if not inexpensive_plan(query_plan, ordered=ordered):
+                raise ValueError(
+                    "Even an unordered sample has an expensive plan; use an explicit F5 query"
+                )
+            captured = self._fetch(conn, statement)
+        return PreviewResult(statement, self._finish(captured, started), ordered)
+
+    def _fetch(self, conn: psycopg.Connection, statement: str) -> tuple:
+        """Capture one bounded result inside the owning transaction and cancellation lifetime."""
+        if self._cancel.is_set():
+            raise QueryCancelled("Query cancelled before execution")
+        with self._state_lock:
+            self._sent += len(statement.encode("utf-8"))
+        with conn.cursor() as cursor:
+            cursor.execute(statement, prepare=False)
+            columns = tuple(column.name for column in cursor.description or ())
+            rows = cursor.fetchmany(self.config.row_limit + 1) if cursor.description else []
+            truncated = len(rows) > self.config.row_limit
+            if truncated:
+                rows.pop()
+            status = cursor.statusmessage or "Statement completed"
+        if self._cancel.is_set():
+            raise QueryCancelled("Query cancelled; transaction rolled back")
+        return columns, tuple(rows), status, truncated
+
+    def _finish(self, captured: tuple, started: float) -> QueryResult:
+        """Publish elapsed time and payload counters only after the transaction succeeds."""
+        columns, rows, status, truncated = captured
+        result = QueryResult(columns, rows, status, time.monotonic() - started, truncated)
         with self._state_lock:
             self._received += sum(
                 len(cell_text(value).encode("utf-8")) for row in result.rows for value in row

@@ -32,3 +32,17 @@
 - [x] Make default dotenv resolution independent of cwd.
 - [x] Remove account references from committed configuration example.
 - [x] Verify installed CLI configuration portability and commit.
+
+## Recent-record browsing and direct SQL prompting
+- [x] Define safe recent-record browsing and interaction contract.
+- [x] Add light last hundred records hotkey.
+- [x] Add heavy last hundred records hotkey.
+- [x] Infer light and heavy table queries on first view.
+- [x] Automatically refresh light last five records on selection.
+- [x] Add independent duplicate workspace tab hotkey.
+- [x] Replace AI output pane with smaller prompt input.
+- [x] Insert SQL-only AI responses directly into query editor.
+- [x] Exercise table browsing and duplicate tab workflows.
+- [x] Update affected help and commit verified features.
+- [x] Add settings theme selector with every Oracle TUI theme.
+- [x] Recommend detailed inspection for large structured values.

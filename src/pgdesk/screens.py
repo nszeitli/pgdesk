@@ -16,6 +16,7 @@ from textual.widgets.option_list import Option
 
 from pgdesk.config import Cluster, Config, Settings
 from pgdesk.database import error_text, list_databases
+from pgdesk.themes import THEME_NAMES
 
 
 class Dialog(ModalScreen):
@@ -190,7 +191,7 @@ class ConnectScreen(Dialog):
 
 
 class SettingsScreen(Dialog):
-    """Edit model ID, reasoning, Fast mode and the custom system prompt."""
+    """Edit the Oracle palette, model ID, reasoning, Fast mode and custom system prompt."""
 
     BINDINGS: ClassVar = [*Dialog.BINDINGS, Binding("ctrl+s", "save", "Save", priority=True)]
     DEFAULT_CSS = "SettingsScreen TextArea { height: 9; border: round $primary; }"
@@ -203,7 +204,14 @@ class SettingsScreen(Dialog):
     def compose(self) -> ComposeResult:
         """Keep all preferences and disclosure reachable by Tab and Shift+Tab."""
         with VerticalScroll():
-            yield Label("AI settings · Ctrl+S saves · Escape cancels")
+            yield Label("Settings · Ctrl+S saves · Escape cancels")
+            yield Label("Theme · Oracle TUI palettes")
+            yield Select(
+                [(name, name) for name in THEME_NAMES],
+                value=self.settings.theme,
+                allow_blank=False,
+                id="theme",
+            )
             yield Label("OpenAI model ID")
             yield Input(self.settings.model, id="model")
             yield Label("Reasoning effort · default omits the parameter")
@@ -218,7 +226,7 @@ class SettingsScreen(Dialog):
             yield Label("Custom system prompt")
             yield TextArea(self.settings.system_prompt, id="system-prompt", tab_behavior="focus")
             yield Static(
-                "Credentials come from the configured AWS secret, or OPENAI_API_KEY when no secret is configured. Restart after changing credential references in .env. Each message sends this tab's full accessible table/view schema and conversation to OpenAI, never query results. Responses are not requested for server-side storage.",
+                "Credentials come from the configured AWS secret, or OPENAI_API_KEY when no secret is configured. Restart after changing credential references in .env. Prompts send accessible schema metadata, prompt context and current SQL to OpenAI, never query results. First table previews also send that table's metadata to infer and cache a browsing recipe. Responses are not requested for server-side storage.",
                 classes="hint",
             )
             yield Static("", id="settings-error", classes="error", markup=False)
@@ -233,6 +241,7 @@ class SettingsScreen(Dialog):
             str(self.query_one("#reasoning", Select).value),
             self.query_one("#fast", Switch).value,
             self.query_one("#system-prompt", TextArea).text,
+            theme=str(self.query_one("#theme", Select).value),
         )
         try:
             settings.validate()
@@ -318,27 +327,38 @@ class ExportScreen(Dialog):
 HELP = """PGDesk · keyboard reference
 
 Ctrl+N        Open cluster/database chooser (reloads config)
+Ctrl+D        Duplicate current workspace (independent pool/editor/results)
 Ctrl+W        Close workspace (confirms draft/running work)
 [ / ]         Previous/next workspace outside text inputs
 Ctrl+PageUp/Down  Previous/next workspace from anywhere
 Tab / Shift+Tab   Move focus; editor Tab also moves focus
 Escape        Leave input/editor for schema navigation; dismiss dialog
 /             Filter schema/table/view tree outside text inputs
-Enter         Expand tree; on relation, draft SELECT (does not run)
-F2 / F3 / F4  Toggle AI / SQL / results; visible panes share equal height
+Enter         Expand tree; on table, automatically run a light 5-row preview
+F2 / F3 / F4  Show/focus AI / SQL / results; repeat while focused to hide
 Ctrl+B        Toggle schema sidebar
 Ctrl+Enter / F5   Run selected SQL, otherwise entire editor (one statement)
 F6            Cancel running query (never automatically retried)
 F7            Refresh schema metadata
-F8            Toggle read-only/write mode (writes require confirmation)
-F9            AI settings: model, reasoning, Fast mode, system prompt
-Ctrl+L        Load latest AI SQL draft into editor (never executes)
+F8            Toggle manual read-only/write mode (writes require confirmation)
+F9            Settings: Oracle theme, model, reasoning, Fast mode, prompt
+Ctrl+L        Run light latest 100 for the selected table
+Ctrl+G        Run heavy latest 100 (SELECT *) for the selected table
 Ctrl+S        Export retained result as CSV (no overwrite)
-Ctrl+K        Clear current tab's AI conversation
+Ctrl+K        Clear current tab's AI prompt context
 F1 / ?        This help
 Ctrl+Q        Quit; confirms unsaved work
 
-AI prompt: Enter sends. SQL editor: Enter inserts a newline.
+AI prompt: Enter inserts a SQL-only reply into the editor; F5 executes it.
+SQL editor: Enter inserts a newline. Automatic previews confirm before replacing manual SQL.
+First table use asks AI for useful columns and a descending recency key,
+then caches the recipe for this app session. F7 refreshes metadata and recipes.
+Light previews select up to 8 columns: text capped at 160 characters,
+large/structured fields replaced by __is_null flags. Heavy retrieves full values.
+Automatic previews are read-only, with 2s statement and 200ms lock deadlines.
+If ordering is expensive, an unordered sample is explicitly marked NOT LATEST.
+Views, foreign tables and expensive sample plans require explicit manual SQL/F5.
+Duplicating copies selection, SQL and prompt context, not results or active work.
 All buttons, lists, tabs and table cells are keyboard navigable.
 Run commits on success, rolls back on failure. No manual transaction,
 SET/RESET or COPY session state; pooled runs are isolated. A lost connection

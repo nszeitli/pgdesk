@@ -16,11 +16,14 @@ SELECT n.nspname, c.relname, c.relkind, a.attname,
        pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull,
        pg_catalog.pg_get_expr(d.adbin, d.adrelid),
        (SELECT string_agg(pg_catalog.pg_get_constraintdef(k.oid), '; ' ORDER BY k.conname)
-        FROM pg_catalog.pg_constraint k WHERE k.conrelid = c.oid)
+        FROM pg_catalog.pg_constraint k WHERE k.conrelid = c.oid),
+       s.avg_width
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
 LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+LEFT JOIN pg_catalog.pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+                              AND s.attname = a.attname AND NOT s.inherited
 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
   AND n.nspname NOT LIKE 'pg_toast%%' AND n.nspname NOT LIKE 'pg_temp_%%'
@@ -34,6 +37,18 @@ WHERE nspname NOT IN ('pg_catalog', 'information_schema')
 AND nspname NOT LIKE 'pg_toast%%' AND nspname NOT LIKE 'pg_temp_%%'
 AND has_schema_privilege(oid, 'USAGE') ORDER BY nspname
 """
+INDEXES_SQL = """
+SELECT n.nspname, c.relname, pg_catalog.pg_get_indexdef(i.indexrelid)
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE i.indisvalid AND i.indisready
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%%' AND n.nspname NOT LIKE 'pg_temp_%%'
+  AND has_schema_privilege(n.oid, 'USAGE')
+  AND (has_table_privilege(c.oid, 'SELECT') OR has_any_column_privilege(c.oid, 'SELECT'))
+ORDER BY n.nspname, c.relname, i.indexrelid
+"""
 
 
 @dataclass(frozen=True)
@@ -44,6 +59,7 @@ class Column:
     data_type: str
     not_null: bool
     default: str | None
+    average_width: int | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +71,7 @@ class Relation:
     kind: str
     columns: tuple[Column, ...]
     constraints: str = ""
+    indexes: tuple[str, ...] = ()
 
     @property
     def qualified(self) -> str:
@@ -65,10 +82,6 @@ class Relation:
     def is_view(self) -> bool:
         """Group normal and materialized views separately from tables."""
         return self.kind in {"v", "m"}
-
-    def preview_sql(self, limit: int = 100) -> str:
-        """Draft a bounded read without executing it or interpolating unsafe identifiers."""
-        return f"SELECT * FROM {self.qualified}\nLIMIT {int(limit)};"
 
 
 @dataclass(frozen=True)
@@ -94,10 +107,12 @@ class Catalog:
                                 "type": c.data_type,
                                 "not_null": c.not_null,
                                 "default": c.default,
+                                "average_width": c.average_width,
                             }
                             for c in r.columns
                         ],
                         "constraints": r.constraints,
+                        "indexes": r.indexes,
                     }
                     for r in self.relations
                 ],
@@ -106,17 +121,27 @@ class Catalog:
         )
 
 
-def build_catalog(schemas: list[tuple], rows: list[tuple]) -> Catalog:
+def build_catalog(schemas: list[tuple], rows: list[tuple], indexes: list[tuple]) -> Catalog:
     """Group the ordered catalog query without losing empty tables or schemas."""
     groups: dict[tuple[str, str], dict] = {}
-    for schema, name, kind, column, data_type, not_null, default, constraints in rows:
+    relation_indexes: dict[tuple[str, str], list[str]] = {}
+    for schema, name, definition in indexes:
+        relation_indexes.setdefault((schema, name), []).append(definition)
+    for schema, name, kind, column, data_type, not_null, default, constraints, width in rows:
         group = groups.setdefault(
             (schema, name), {"kind": kind, "columns": [], "constraints": constraints or ""}
         )
         if column is not None:
-            group["columns"].append(Column(column, data_type, not_null, default))
+            group["columns"].append(Column(column, data_type, not_null, default, width))
     relations = tuple(
-        Relation(schema, name, group["kind"], tuple(group["columns"]), group["constraints"])
+        Relation(
+            schema,
+            name,
+            group["kind"],
+            tuple(group["columns"]),
+            group["constraints"],
+            tuple(relation_indexes.get((schema, name), ())),
+        )
         for (schema, name), group in groups.items()
     )
     return Catalog(tuple(row[0] for row in schemas), relations)

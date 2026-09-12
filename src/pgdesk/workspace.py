@@ -11,13 +11,15 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Input, Label, RichLog, Static, TextArea, Tree
+from textual.widgets import Button, DataTable, Input, Label, Static, TextArea, Tree
 
-from pgdesk.ai import SqlAssistant, Suggestion
+from pgdesk.ai import SqlAssistant
+from pgdesk.browsing import BrowsePlan
 from pgdesk.catalog import Catalog, QueryResult, Relation, cell_text
 from pgdesk.config import Cluster, Config
 from pgdesk.database import DatabaseSession, error_text
 from pgdesk.screens import ConfirmScreen, ExportScreen
+from pgdesk.themes import editor_theme
 
 
 class Workspace(Horizontal):
@@ -30,12 +32,13 @@ class Workspace(Horizontal):
     Workspace Tree { height: 1fr; scrollbar-size: 1 1; }
     Workspace .panels { width: 1fr; }
     Workspace .work-panel { height: 1fr; min-height: 5; border: round $primary; }
+    Workspace #ai-panel { height: 8; min-height: 8; }
+    Workspace #ai-status { height: 2; padding: 0 1; color: $text-muted; }
     Workspace .panel-title { height: 1; color: $accent; text-style: bold; padding: 0 1; }
     Workspace .panel-tools { height: 3; }
     Workspace .panel-tools Button { min-width: 9; height: 3; }
     Workspace .panel-tools Input { width: 1fr; }
     Workspace TextArea { height: 1fr; }
-    Workspace RichLog { height: 1fr; padding: 0 1; }
     Workspace DataTable { height: 1fr; }
     Workspace .result-status { height: auto; max-height: 5; padding: 0 1; }
     Workspace .empty-panels { height: 1fr; content-align: center middle; color: $text-muted; }
@@ -53,7 +56,11 @@ class Workspace(Horizontal):
         self.session = DatabaseSession(cluster, database, config)
         self.catalog_snapshot: Catalog | None = None
         self.result: QueryResult | None = None
-        self.suggestion: Suggestion | None = None
+        self.selected_relation: Relation | None = None
+        self._generated_sql = ""
+        self._selection_generation = 0
+        self._browse_task: asyncio.Task | None = None
+        self._query_is_preview = False
         self.history: list[dict[str, str]] = []
         self.read_only = True
         self.closing = False
@@ -64,29 +71,31 @@ class Workspace(Horizontal):
         self._shutdown_task: asyncio.Task | None = None
 
     def compose(self) -> ComposeResult:
-        """Compose the left hierarchy and three equally weighted right-hand panels."""
+        """Compose schema navigation, a compact AI prompt, and equally weighted SQL/results."""
         with Vertical(classes="sidebar"):
             yield Label(" SCHEMAS / RELATIONS", classes="panel-title")
             yield Input(placeholder="/ Filter schema or relation", id="tree-filter")
             yield Tree("Loading schema…", id="schema-tree")
         with Vertical(classes="panels"):
             with Vertical(id="ai-panel", classes="work-panel"):
-                yield Label(" AI · schema-aware SQL drafts · F2", classes="panel-title")
-                yield RichLog(
-                    id="ai-log", wrap=True, markup=False, highlight=False, auto_scroll=True
-                )
+                yield Label(" AI PROMPT · F2 focuses · Enter drafts SQL", classes="panel-title")
                 with Horizontal(classes="panel-tools"):
                     yield Input(
-                        placeholder="Ask for SQL · Enter sends · Ctrl+L loads draft", id="ai-input"
+                        placeholder="Ask for SQL… Enter puts the answer in the editor",
+                        id="ai-input",
                     )
                     yield Button("Send", id="send-ai", variant="primary")
-                    yield Button("Load SQL", id="load-ai")
+                yield Static(
+                    "SQL only · F5 executes · Ctrl+K clears prompt context",
+                    id="ai-status",
+                    markup=False,
+                )
             with Vertical(id="sql-panel", classes="work-panel"):
-                yield Label(" SQL · READ ONLY · F3", id="sql-title", classes="panel-title")
+                yield Label(" SQL · READ ONLY · F3 focuses", id="sql-title", classes="panel-title")
                 yield TextArea.code_editor(
                     "",
                     language="sql",
-                    theme="monokai",
+                    theme="css",
                     id="sql-editor",
                     tab_behavior="focus",
                     soft_wrap=False,
@@ -100,10 +109,11 @@ class Workspace(Horizontal):
                     )
             with Vertical(id="data-panel", classes="work-panel"):
                 yield Label(
-                    " RESULTS · arrows navigate · Ctrl+S exports · F4", classes="panel-title"
+                    " RESULTS · Ctrl+L light 100 · Ctrl+G heavy 100 · F4 focuses",
+                    classes="panel-title",
                 )
                 yield Static(
-                    "Select a table to draft a query, or write SQL and press F5.",
+                    "Select a table for a light 5-row preview, or write SQL and press F5.",
                     id="result-status",
                     classes="result-status",
                     markup=False,
@@ -114,11 +124,17 @@ class Workspace(Horizontal):
     def on_mount(self) -> None:
         """Begin schema preload and retry only missing metadata after connection recovery."""
         self.query_one("#empty-panels").display = False
-        self.query_one("#ai-log", RichLog).write(
-            "Ask for SQL using this tab's complete accessible schema. Drafts never execute automatically. F9 configures OpenAI."
-        )
+        self.apply_theme()
+        self.set_ai_status("SQL only · F5 executes · Ctrl+K clears prompt context")
         self.refresh_catalog()
         self.set_interval(5, self.ensure_catalog)
+
+    def apply_theme(self) -> None:
+        """Apply the saved Oracle palette to SQL syntax as well as the surrounding interface."""
+        editor = self.query_one("#sql-editor", TextArea)
+        theme = editor_theme(self.app.settings.theme)
+        editor.register_theme(theme)
+        editor.theme = theme.name
 
     def spawn(self, coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task:
         """Retain a tab task until completion so close can await all resource borrowers."""
@@ -131,7 +147,10 @@ class Workspace(Horizontal):
     def has_draft(self) -> bool:
         """Report in-memory work that would be lost by closing this tab."""
         return bool(
-            self.query_one("#sql-editor", TextArea).text.strip()
+            (
+                self.query_one("#sql-editor", TextArea).text.strip()
+                and self.query_one("#sql-editor", TextArea).text != self._generated_sql
+            )
             or self.history
             or self.query_one("#ai-input", Input).value.strip()
         )
@@ -141,10 +160,15 @@ class Workspace(Horizontal):
         if self.catalog_snapshot is None:
             self.refresh_catalog()
 
-    def refresh_catalog(self) -> None:
+    def refresh_catalog(self, *, replan: bool = False) -> None:
         """Schedule one metadata refresh without replacing a usable prior snapshot on failure."""
         if self.closing or (self.catalog_task and not self.catalog_task.done()):
             return
+        if replan:
+            self.app.browsing.invalidate(self.cluster, self.database)
+            self._selection_generation += 1
+            if self._browse_task and not self._browse_task.done():
+                self._browse_task.cancel()
         self.catalog_task = self.spawn(self._load_catalog())
 
     async def _load_catalog(self) -> None:
@@ -160,6 +184,16 @@ class Workspace(Horizontal):
             return
         if not self.closing:
             self.catalog_snapshot = catalog
+            if self.selected_relation is not None:
+                key = (self.selected_relation.schema, self.selected_relation.name)
+                self.selected_relation = next(
+                    (
+                        relation
+                        for relation in catalog.relations
+                        if (relation.schema, relation.name) == key
+                    ),
+                    None,
+                )
             self.rebuild_tree()
 
     @on(Input.Changed, "#tree-filter")
@@ -175,6 +209,7 @@ class Workspace(Horizontal):
         tree.clear()
         tree.root.set_label(Text(self.database))
         query = self.query_one("#tree-filter", Input).value.casefold()
+        selected_node = None
         for schema in self.catalog_snapshot.schemas:
             relations = [
                 r
@@ -190,6 +225,12 @@ class Workspace(Horizontal):
                     if relation.is_view != is_view:
                         continue
                     relation_node = group.add(Text(relation.name), data=relation, expand=False)
+                    if self.selected_relation and (relation.schema, relation.name) == (
+                        self.selected_relation.schema,
+                        self.selected_relation.name,
+                    ):
+                        selected_node = relation_node
+                        group.expand()
                     for column in relation.columns:
                         relation_node.add_leaf(
                             Text(
@@ -198,12 +239,14 @@ class Workspace(Horizontal):
                             )
                         )
         tree.root.expand()
+        if selected_node is not None:
+            tree.call_after_refresh(tree.move_cursor, selected_node)
 
     @on(Tree.NodeSelected, "#schema-tree")
     def relation_selected(self, event: Tree.NodeSelected) -> None:
-        """Draft a safely quoted preview; never run on tree navigation."""
+        """Refresh a light five-row preview when a relation is deliberately selected."""
         if isinstance(event.node.data, Relation):
-            self.load_sql(event.node.data.preview_sql())
+            self.browse(relation=event.node.data)
 
     def load_sql(self, statement: str) -> None:
         """Confirm before overwriting another draft and preserve explicit execution."""
@@ -222,21 +265,30 @@ class Workspace(Horizontal):
         else:
             self._replace_sql(statement)
 
-    def _replace_sql(self, statement: str) -> None:
-        """Show and focus the editor with a chosen SQL draft."""
+    def _replace_sql(self, statement: str, *, preview: bool = False, focus: bool = True) -> None:
+        """Publish SQL to this editor without stealing focus from a different workspace."""
         self.query_one("#sql-panel").display = True
         self.update_empty_panels()
         editor = self.query_one("#sql-editor", TextArea)
         editor.load_text(statement)
-        editor.focus()
+        self._generated_sql = statement if preview else ""
+        if focus and self.app.active_workspace is self:
+            editor.focus()
 
     def toggle_panel(self, name: str) -> None:
-        """Let Textual distribute equal fractional heights among only the visible panels."""
+        """Show/focus a primary control, hiding only when that control already has focus."""
         panel = self.query_one(f"#{name}-panel")
-        panel.display = not panel.display
-        self.update_empty_panels()
-        if not panel.display:
+        primary = self.query_one(
+            {"ai": "#ai-input", "sql": "#sql-editor", "data": "#results"}[name]
+        )
+        if panel.display and primary.has_focus:
+            panel.display = False
+            self.query_one(".sidebar").display = True
             self.query_one("#schema-tree", Tree).focus()
+        else:
+            panel.display = True
+            primary.focus()
+        self.update_empty_panels()
 
     def update_empty_panels(self) -> None:
         """Keep an actionable empty state when all three main panels are hidden."""
@@ -248,6 +300,134 @@ class Workspace(Horizontal):
         """Display a plain-text result or error message without terminal markup injection."""
         self.query_one("#result-status", Static).update(text)
 
+    def set_ai_status(self, text: str) -> None:
+        """Keep request progress/errors visible without an AI transcript pane."""
+        self.query_one("#ai-status", Static).update(text)
+
+    def copy_from(self, source: Workspace) -> None:
+        """Copy drafts and immutable metadata, never results, running tasks or write permission."""
+        self.catalog_snapshot = source.catalog_snapshot
+        self.selected_relation = source.selected_relation
+        self.history = [turn.copy() for turn in source.history]
+        self.query_one("#ai-input", Input).value = source.query_one("#ai-input", Input).value
+        self._replace_sql(source.query_one("#sql-editor", TextArea).text, focus=False)
+        self._generated_sql = source._generated_sql
+        self.rebuild_tree()
+
+    def browse(
+        self, limit: int = 5, heavy: bool = False, *, relation: Relation | None = None
+    ) -> None:
+        """Request a bounded table view without silently discarding manual work or cancelling writes."""
+        target = relation or self.selected_relation
+        if target is None:
+            self.set_status("Select a table first; Ctrl+L light 100 · Ctrl+G heavy 100.")
+            return
+        if not target.columns:
+            self.set_status("No visible columns for a light preview; use an explicit F5 query.")
+            return
+        if self.query_task and not self.query_task.done() and not self._query_is_preview:
+            self.set_status(
+                "A manual query is running. F6 cancels; table browsing did not interrupt it."
+            )
+            return
+        editor = self.query_one("#sql-editor", TextArea)
+        if editor.text.strip() and editor.text != self._generated_sql:
+            self.app.push_screen(
+                ConfirmScreen(
+                    "Replace the edited SQL with a table preview? Duplicate with Ctrl+D to keep both."
+                ),
+                lambda yes: (
+                    self._start_browse(target, limit, heavy) if yes and not self.closing else None
+                ),
+            )
+            return
+        self._start_browse(target, limit, heavy)
+
+    def _start_browse(self, relation: Relation, limit: int, heavy: bool) -> None:
+        """Fence older selections and own only the new metadata/AI preparation waiter."""
+        if self.closing:
+            return
+        self._selection_generation += 1
+        self.selected_relation = relation
+        if self._browse_task and not self._browse_task.done():
+            self._browse_task.cancel()
+        before = self.query_one("#sql-editor", TextArea).text
+        self.query_one("#data-panel").display = True
+        self.update_empty_panels()
+        self.set_status(
+            f"Preparing {'heavy' if heavy else 'light'} {limit} · {relation.qualified}…"
+        )
+        self._browse_task = self.spawn(
+            self._prepare_preview(relation, limit, heavy, self._selection_generation, before)
+        )
+
+    async def _prepare_preview(
+        self, relation: Relation, limit: int, heavy: bool, generation: int, before: str
+    ) -> None:
+        """Await inference without a pool borrower; cancel/await an older automatic read first."""
+        try:
+            if self.query_task and not self.query_task.done():
+                await asyncio.to_thread(self.session.cancel)
+                await asyncio.shield(self.query_task)
+        except Exception as error:
+            if not self.closing and generation == self._selection_generation:
+                self.set_status(error_text(error))
+            return
+        warning = ""
+        try:
+            plan = await self.app.browsing.plan(
+                self.cluster, self.database, relation, self.app.settings
+            )
+        except asyncio.CancelledError:
+            if not self.closing and generation == self._selection_generation:
+                self.set_status("Preview preparation cancelled or invalidated; reselect to retry.")
+            raise
+        except Exception as error:
+            warning = "AI recipe unavailable; showing a sample. " + error_text(error)
+            plan = BrowsePlan.sample(relation)
+        if self.closing or generation != self._selection_generation:
+            return
+        if self.query_one("#sql-editor", TextArea).text != before:
+            self.set_status(
+                "Preview not started: SQL changed while its recipe was being prepared. Reselect to retry."
+            )
+            return
+        if warning:
+            self.set_ai_status(warning)
+        self._replace_sql(plan.sql(limit, heavy), preview=True, focus=False)
+        self._query_is_preview = True
+        self.query_task = self.spawn(self._execute_preview(plan, limit, heavy, generation))
+
+    async def _execute_preview(
+        self, plan: BrowsePlan, limit: int, heavy: bool, generation: int
+    ) -> None:
+        """Run an automatic read and publish only if its selection still owns the workspace."""
+        self._begin_result("Checking preview cost, then reading… F6 cancels")
+        before = self.query_one("#sql-editor", TextArea).text
+        try:
+            preview = await asyncio.to_thread(self.session.preview, plan, limit, heavy)
+            if self.closing or generation != self._selection_generation:
+                return
+            if self.query_one("#sql-editor", TextArea).text == before:
+                self._replace_sql(preview.statement, preview=True, focus=False)
+            provenance = (
+                "LATEST · AI-inferred order" if preview.ordered else "UNORDERED SAMPLE — NOT LATEST"
+            )
+            projection = (
+                "HEAVY · all columns"
+                if heavy
+                else "LIGHT · text capped at 160; large fields show __is_null"
+            )
+            await self._publish_result(
+                preview.result, f"{provenance} · {projection} · ", generation
+            )
+        except Exception as error:
+            if not self.closing and generation == self._selection_generation:
+                self.set_status(error_text(error))
+        finally:
+            if not self.closing and self.query_task is asyncio.current_task():
+                self.query_one("#run", Button).disabled = False
+
     def run_query(self) -> None:
         """Capture query and mode before scheduling work so later edits cannot retarget it."""
         if self.closing or (self.query_task and not self.query_task.done()):
@@ -257,46 +437,24 @@ class Workspace(Horizontal):
         if not statement.strip():
             self.set_status("Write SQL or select a relation first.")
             return
+        self._selection_generation += 1
+        if self._browse_task and not self._browse_task.done():
+            self._browse_task.cancel()
+        self._query_is_preview = False
         self.query_one("#data-panel").display = True
         self.update_empty_panels()
         self.query_task = self.spawn(self._execute(statement, self.read_only))
 
     async def _execute(self, statement: str, read_only: bool) -> None:
         """Replace stale output immediately and publish committed results or a visible error."""
-        self.result = None
-        table = self.query_one("#results", DataTable)
-        table.clear(columns=True)
-        self.query_one("#run", Button).disabled = True
-        self.set_status(
+        self._begin_result(
             "Running READ ONLY… F6 cancels"
             if read_only
             else "Running WRITE transaction… F6 cancels; success commits"
         )
         try:
             result = await asyncio.to_thread(self.session.execute, statement, read_only)
-            if self.closing:
-                return
-            self.result = result
-            for index, name in enumerate(result.columns):
-                table.add_column(Text(name), key=str(index), width=min(60, max(12, len(name))))
-            for offset in range(0, len(result.rows), 200):
-                table.add_rows(
-                    [
-                        tuple(Text(cell_text(value)[:2000]) for value in row)
-                        for row in result.rows[offset : offset + 200]
-                    ]
-                )
-                await asyncio.sleep(0)
-                if self.closing:
-                    return
-            suffix = (
-                f" · TRUNCATED to {len(result.rows):,} retained rows (CSV exports these only)"
-                if result.truncated
-                else ""
-            )
-            self.set_status(
-                f"{result.status} · {result.elapsed:.3f}s · {len(result.rows):,} rows{suffix}"
-            )
+            await self._publish_result(result)
         except Exception as error:
             if not self.closing:
                 self.set_status(error_text(error))
@@ -304,11 +462,55 @@ class Workspace(Horizontal):
             if not self.closing:
                 self.query_one("#run", Button).disabled = False
 
+    def _begin_result(self, status: str) -> None:
+        """Remove stale rows and disable Run while one operation owns the result surface."""
+        self.result = None
+        self.query_one("#results", DataTable).clear(columns=True)
+        self.query_one("#run", Button).disabled = True
+        self.set_status(status)
+
+    async def _publish_result(
+        self, result: QueryResult, prefix: str = "", generation: int | None = None
+    ) -> None:
+        """Render in bounded batches while fencing a superseded automatic selection."""
+        if self.closing or (generation is not None and generation != self._selection_generation):
+            return
+        self.result = result
+        table = self.query_one("#results", DataTable)
+        for index, name in enumerate(result.columns):
+            table.add_column(Text(name), key=str(index), width=min(60, max(12, len(name))))
+        for offset in range(0, len(result.rows), 200):
+            table.add_rows(
+                [
+                    tuple(Text(cell_text(value)[:2000]) for value in row)
+                    for row in result.rows[offset : offset + 200]
+                ]
+            )
+            await asyncio.sleep(0)
+            if self.closing or (
+                generation is not None and generation != self._selection_generation
+            ):
+                return
+        suffix = (
+            f" · TRUNCATED to {len(result.rows):,} retained rows (CSV exports these only)"
+            if result.truncated
+            else ""
+        )
+        self.set_status(
+            f"{prefix}{result.status} · {result.elapsed:.3f}s · {len(result.rows):,} rows{suffix}"
+        )
+
     async def cancel_query(self) -> None:
         """Request database cancellation off the UI thread and report cancellation failures."""
+        self._selection_generation += 1
+        if self._browse_task and not self._browse_task.done():
+            self._browse_task.cancel()
+            self.set_status("Preview preparation cancelled.")
         if self.query_task and not self.query_task.done():
             try:
                 await asyncio.to_thread(self.session.cancel)
+                if self._query_is_preview:
+                    self.set_status("Preview cancelled.")
             except Exception as error:
                 self.set_status(error_text(error))
 
@@ -322,7 +524,7 @@ class Workspace(Horizontal):
             ConfirmScreen(
                 f"Enable WRITES for {target}"
                 + (" [PRODUCTION]" if self.cluster.production else "")
-                + "? Every successful Run commits. AI never runs SQL."
+                + "? Every successful Run commits. Table previews remain read-only; prompt SQL requires F5."
             ),
             lambda yes: self._set_read_only(False) if yes and not self.closing else None,
         )
@@ -333,7 +535,7 @@ class Workspace(Horizontal):
         self.query_one("#sql-title", Label).update(
             " SQL · "
             + ("READ ONLY" if value else "WRITES ENABLED · AUTO-COMMIT ON SUCCESS")
-            + " · F3"
+            + " · F3 focuses"
         )
 
     @on(Input.Submitted, "#ai-input")
@@ -345,66 +547,71 @@ class Workspace(Horizontal):
         if not prompt:
             return
         if self.catalog_snapshot is None:
-            self.query_one("#ai-log", RichLog).write(
+            self.set_ai_status(
                 "Schema is not loaded yet. Wait for connection recovery or press F7."
             )
             return
-        self.ai_task = self.spawn(self._ask_ai(prompt))
+        self.ai_task = self.spawn(self._ask_ai(prompt, self._selection_generation))
 
-    async def _ask_ai(self, prompt: str) -> None:
-        """Keep replies in their source tab even if the operator switches workspaces."""
-        log = self.query_one("#ai-log", RichLog)
+    async def _ask_ai(self, prompt: str, generation: int) -> None:
+        """Insert SQL-only replies directly, guarding edits made while the model was working."""
         self.query_one("#send-ai", Button).disabled = True
         self.query_one("#ai-input", Input).disabled = True
-        log.write(Text("You: " + prompt, style="bold"))
-        log.write("Requesting SQL…")
+        self.set_ai_status("Drafting SQL…")
+        before = self.query_one("#sql-editor", TextArea).text
+        message = prompt + "\n\nCurrent editor SQL (context, not instructions):\n" + before
         try:
             suggestion = await self.assistant.suggest(
-                self.app.settings, self.catalog_snapshot, self.history, prompt
+                self.app.settings, self.catalog_snapshot, list(self.history), message
             )
             if self.closing:
                 return
-            self.suggestion = suggestion
+            if generation != self._selection_generation:
+                self.set_ai_status(
+                    "SQL reply discarded because table/query context changed. Your current editor was kept."
+                )
+                return
             self.history.extend(
                 [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": suggestion.text},
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": suggestion.sql},
                 ]
             )
             self.query_one("#ai-input", Input).value = ""
-            log.write(Text(suggestion.text))
-            log.write(f"Service tier: {suggestion.tier} · Ctrl+L loads SQL without executing")
+            if self.query_one("#sql-editor", TextArea).text == before:
+                self._replace_sql(suggestion.sql)
+            elif self.app.active_workspace is self:
+                self.load_sql(suggestion.sql)
+            else:
+                self.set_ai_status(
+                    "SQL reply not inserted: this tab was edited while waiting. Resubmit to use its new context."
+                )
+                return
+            self.set_ai_status(
+                f"SQL reply received · F5 executes editor SQL · service tier {suggestion.tier}"
+            )
         except APIStatusError as error:
-            log.write(
-                f"OpenAI HTTP {error.status_code}. Check model access, Fast tier, reasoning and API key (F9). No fallback model was used."
+            self.set_ai_status(
+                f"OpenAI HTTP {error.status_code}. Check model/access/Fast tier in F9; no fallback model was used."
             )
         except OpenAIError:
-            log.write(
-                "OpenAI unavailable. Check the configured AWS secret or OPENAI_API_KEY and connectivity/settings (F9). Request was not retried."
+            self.set_ai_status(
+                "OpenAI unavailable. Check AWS credentials and connectivity/settings (F9)."
             )
         except Exception as error:
-            log.write(error_text(error))
+            self.set_ai_status(error_text(error))
         finally:
             if not self.closing:
                 self.query_one("#send-ai", Button).disabled = False
                 self.query_one("#ai-input", Input).disabled = False
 
-    def load_ai(self) -> None:
-        """Insert only a concrete latest SQL draft, never execute it or guess prose is SQL."""
-        if self.suggestion and self.suggestion.sql:
-            self.load_sql(self.suggestion.sql)
-        else:
-            self.query_one("#ai-log", RichLog).write(
-                "No single SQL draft available; ask for one statement in a SQL code fence."
-            )
-
     def clear_ai(self) -> None:
-        """Clear only this tab's conversation when no request is using its history."""
+        """Clear only this tab's prompt context when no request is using it."""
         if self.ai_task and not self.ai_task.done():
             return
         self.history.clear()
-        self.suggestion = None
-        self.query_one("#ai-log", RichLog).clear()
+        self.query_one("#ai-input", Input).value = ""
+        self.set_ai_status("Prompt context cleared · Enter drafts SQL; F5 executes")
 
     def export(self) -> None:
         """Capture the current result so a later query cannot change the export target."""
@@ -442,8 +649,6 @@ class Workspace(Horizontal):
                 await self.cancel_query()
             case "send-ai":
                 self.submit_ai()
-            case "load-ai":
-                self.load_ai()
 
     async def shutdown(self) -> None:
         """Await the same shielded cleanup when tab close and application exit overlap."""
@@ -456,6 +661,8 @@ class Workspace(Horizontal):
         """Cancel AI/SQL, await every borrower, then dispose of the physical pool."""
         if self.ai_task and not self.ai_task.done():
             self.ai_task.cancel()
+        if self._browse_task and not self._browse_task.done():
+            self._browse_task.cancel()
         try:
             await asyncio.to_thread(self.session.cancel)
         finally:
