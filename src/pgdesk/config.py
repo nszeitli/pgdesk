@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
-import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from dotenv import dotenv_values
+
+from pgdesk.aws_secrets import AwsSecret
 
 CONFIG_DIR = Path.home() / ".config" / "pgdesk"
 DEFAULT_PROMPT = (
@@ -21,7 +25,7 @@ DEFAULT_PROMPT = (
 
 @dataclass(frozen=True)
 class Cluster:
-    """One named cluster resolved through a libpq service or DSN environment variable."""
+    """One named cluster resolved through libpq, an environment DSN or an AWS RDS secret."""
 
     name: str
     service: str = ""
@@ -29,12 +33,15 @@ class Cluster:
     maintenance_database: str = "postgres"
     databases: tuple[str, ...] = ()
     production: bool = False
+    aws_secret: AwsSecret | None = None
 
     def connection_kwargs(self, database: str) -> dict:
         """Resolve credentials at connection time without exposing them in representation."""
         from psycopg.conninfo import conninfo_to_dict
 
-        if self.service:
+        if self.aws_secret is not None:
+            kwargs = self.aws_secret.postgres_kwargs()
+        elif self.service:
             kwargs = {"service": self.service}
         else:
             value = os.environ.get(self.dsn_env)
@@ -85,51 +92,120 @@ class Config:
     row_limit: int = 10000
     statement_timeout_seconds: int = 120
     settings_path: Path = field(default_factory=lambda: CONFIG_DIR / "settings.json")
+    openai_secret: AwsSecret | None = None
+    openai_key_path: tuple[str, ...] = ("openai_api_key",)
+
+
+def _aws_reference(values: dict[str, str], prefix: str) -> AwsSecret | None:
+    """Require the full profile/region/secret triple whenever any reference field is present."""
+    fields = {"profile": "AWS_PROFILE", "region": "AWS_REGION", "secret_id": "SECRET_ID"}
+    if not any(prefix + suffix in values for suffix in fields.values()):
+        return None
+    return AwsSecret.from_config(
+        {name: values.get(prefix + suffix, "") for name, suffix in fields.items()}
+    )
+
+
+def _cluster(values: dict[str, str], identity: str) -> Cluster:
+    """Map one named dotenv section into an unambiguous credential source."""
+    prefix = f"PGDESK_{identity.upper()}_"
+    production = values.get(prefix + "PRODUCTION", "false").lower()
+    if production not in {"true", "false"}:
+        raise ValueError(f"{prefix}PRODUCTION must be true or false")
+    try:
+        databases = json.loads(values.get(prefix + "DATABASES", "[]"))
+    except ValueError:
+        raise ValueError(f"{prefix}DATABASES must be a JSON array of database names") from None
+    if not isinstance(databases, list) or any(
+        not isinstance(name, str) or not name for name in databases
+    ):
+        raise ValueError(f"{prefix}DATABASES must be a JSON array of database names")
+    cluster = Cluster(
+        name=values.get(prefix + "NAME", identity),
+        service=values.get(prefix + "SERVICE", ""),
+        dsn_env=values.get(prefix + "DSN_ENV", ""),
+        maintenance_database=values.get(prefix + "MAINTENANCE_DATABASE", "postgres"),
+        databases=tuple(databases),
+        production=production == "true",
+        aws_secret=_aws_reference(values, prefix),
+    )
+    if not cluster.name or not cluster.maintenance_database:
+        raise ValueError("Cluster name and maintenance database must not be empty")
+    if sum((bool(cluster.service), bool(cluster.dsn_env), cluster.aws_secret is not None)) != 1:
+        raise ValueError(
+            "Each cluster needs exactly one of SERVICE, DSN_ENV or an AWS secret reference"
+        )
+    return cluster
 
 
 def load_config(path: Path) -> Config:
-    """Load version-one TOML, accepting a missing file as a first-run empty workspace."""
+    """Read references from a dotenv file without mutating or interpolating process credentials."""
     if not path.exists():
         return Config()
-    data = tomllib.loads(path.read_text())
-    if data.get("version", 1) != 1:
-        raise ValueError("Unsupported configuration version")
-    clusters = []
-    for entry in data.get("clusters", []):
-        allowed = {"name", "service", "dsn_env", "maintenance_database", "databases", "production"}
-        if set(entry) - allowed:
-            raise ValueError("Unknown cluster field; use service or dsn_env, never an embedded DSN")
-        entry = dict(entry)
-        databases = entry.pop("databases", [])
-        if not isinstance(databases, list) or any(
-            not isinstance(x, str) or not x for x in databases
-        ):
-            raise ValueError("databases must be a list of database names")
-        cluster = Cluster(**entry, databases=tuple(databases))
-        if not cluster.name or bool(cluster.service) == bool(cluster.dsn_env):
-            raise ValueError("Each cluster needs a name and exactly one of service or dsn_env")
-        if any(
-            not isinstance(getattr(cluster, key), str)
-            for key in ("name", "service", "dsn_env", "maintenance_database")
-        ):
-            raise ValueError("Cluster names and connection references must be strings")
-        if not isinstance(cluster.production, bool):
-            raise ValueError("production must be true or false")
-        clusters.append(cluster)
-    if len({c.name for c in clusters}) != len(clusters):
-        raise ValueError("Cluster names must be unique")
+    values = {key: value or "" for key, value in dotenv_values(path, interpolate=False).items()}
+    identities = (
+        [name.strip() for name in values.get("PGDESK_CLUSTERS", "").split(",")]
+        if values.get("PGDESK_CLUSTERS")
+        else []
+    )
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) for name in identities):
+        raise ValueError(
+            "PGDESK_CLUSTERS must contain comma-separated identifiers using letters, digits and underscores"
+        )
+    if len({name.upper() for name in identities}) != len(identities):
+        raise ValueError("Cluster identifiers must be unique, ignoring case")
+    if any(name.upper() == "OPENAI" for name in identities):
+        raise ValueError(
+            "OPENAI is reserved for AI credentials; use a different cluster identifier"
+        )
     limits = {
-        "pool_size": (1, 8, 2),
-        "row_limit": (1, 100000, 10000),
-        "statement_timeout_seconds": (1, 3600, 120),
+        "POOL_SIZE": (1, 8, 2),
+        "ROW_LIMIT": (1, 100000, 10000),
+        "STATEMENT_TIMEOUT_SECONDS": (1, 3600, 120),
     }
-    values = {}
+    known = {"PGDESK_CLUSTERS", "PGDESK_OPENAI_KEY_PATH"}
+    known.update("PGDESK_" + key for key in limits)
+    known.update("PGDESK_OPENAI_" + key for key in ("AWS_PROFILE", "AWS_REGION", "SECRET_ID"))
+    for identity in identities:
+        known.update(
+            f"PGDESK_{identity.upper()}_{key}"
+            for key in (
+                "NAME",
+                "SERVICE",
+                "DSN_ENV",
+                "MAINTENANCE_DATABASE",
+                "DATABASES",
+                "PRODUCTION",
+                "AWS_PROFILE",
+                "AWS_REGION",
+                "SECRET_ID",
+            )
+        )
+    if set(values) - known:
+        raise ValueError(
+            "Unknown .env setting; use .env.example and keep credential values in Secrets Manager or the process environment"
+        )
+    clusters = tuple(_cluster(values, identity) for identity in identities)
+    if len({cluster.name for cluster in clusters}) != len(clusters):
+        raise ValueError("Cluster names must be unique")
+    options = {}
     for key, (minimum, maximum, default) in limits.items():
-        value = data.get(key, default)
-        if type(value) is not int or not minimum <= value <= maximum:
-            raise ValueError(f"{key} must be between {minimum} and {maximum}")
-        values[key] = value
-    return Config(clusters=tuple(clusters), **values)
+        try:
+            value = int(values.get("PGDESK_" + key, str(default)))
+        except ValueError:
+            raise ValueError(f"PGDESK_{key} must be an integer") from None
+        if not minimum <= value <= maximum:
+            raise ValueError(f"PGDESK_{key} must be between {minimum} and {maximum}")
+        options[key.lower()] = value
+    openai_secret = _aws_reference(values, "PGDESK_OPENAI_")
+    key_path = tuple(values.get("PGDESK_OPENAI_KEY_PATH", "openai_api_key").split("."))
+    if not all(key_path) or ("PGDESK_OPENAI_KEY_PATH" in values and openai_secret is None):
+        raise ValueError(
+            "OpenAI key path needs nonempty dot-separated field names and an AWS secret reference"
+        )
+    return Config(
+        clusters=clusters, openai_secret=openai_secret, openai_key_path=key_path, **options
+    )
 
 
 def load_settings(path: Path) -> Settings:

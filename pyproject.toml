@@ -9,6 +9,7 @@ dependencies = [
   "psycopg[binary,pool]>=3.3,<4",
   "openai>=2,<3",
   "pglast>=7,<8",
+  "python-dotenv>=1,<2",
 ]
 
 [project.scripts]

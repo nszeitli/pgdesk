@@ -1,6 +1,7 @@
 """Regressions for credential boundaries, preference persistence and exact retained CSV data."""
 
 import csv
+import os
 from pathlib import Path
 
 import pytest
@@ -12,18 +13,35 @@ from pgdesk.config import Settings, load_config, load_settings, save_settings
 @pytest.mark.parametrize(
     "entry",
     [
-        'name="duplicate"\nservice="a"\n[[clusters]]\nname="duplicate"\nservice="b"',
-        'name="mixed"\nservice="a"\ndsn_env="DSN"',
-        'name="embedded"\ndsn="postgresql://not-a-real-secret"',
-        'name="missing"',
+        "PGDESK_CLUSTERS=a,b\nPGDESK_A_NAME=duplicate\nPGDESK_A_SERVICE=a\nPGDESK_B_NAME=duplicate\nPGDESK_B_SERVICE=b",
+        "PGDESK_CLUSTERS=a\nPGDESK_A_SERVICE=a\nPGDESK_A_DSN_ENV=DSN",
+        "PGDESK_CLUSTERS=a\nPGDESK_A_DSN=postgresql://not-a-real-secret",
+        "PGDESK_CLUSTERS=a",
+        "PGDESK_CLUSTERS=openai\nPGDESK_OPENAI_SERVICE=database",
     ],
 )
 def test_invalid_cluster_references_are_rejected(tmp_path: Path, entry: str) -> None:
     """Ambiguous credentials and duplicate identities must fail before opening any pool."""
-    path = tmp_path / "config.toml"
-    path.write_text("[[clusters]]\n" + entry)
+    path = tmp_path / ".env"
+    path.write_text(entry)
     with pytest.raises((ValueError, TypeError)):
         load_config(path)
+
+
+def test_dotenv_references_do_not_inherit_or_mutate_process_configuration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A shell's unrelated cluster settings cannot retarget the configured database account."""
+    monkeypatch.setenv("PGDESK_CLUSTERS", "ambient")
+    monkeypatch.setenv("UNRELATED_SECRET_NAME", "wrong-account-secret")
+    path = tmp_path / ".env"
+    path.write_text(
+        "PGDESK_CLUSTERS=chosen\nPGDESK_CHOSEN_AWS_PROFILE=test-profile\n"
+        "PGDESK_CHOSEN_AWS_REGION=us-west-2\nPGDESK_CHOSEN_SECRET_ID=${UNRELATED_SECRET_NAME}\n"
+    )
+    config = load_config(path)
+    assert config.clusters[0].aws_secret.secret_id != os.environ["UNRELATED_SECRET_NAME"]
+    assert os.environ["PGDESK_CLUSTERS"] == "ambient"
 
 
 def test_bad_settings_do_not_replace_last_working_preferences(tmp_path: Path) -> None:

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
+from pgdesk.aws_secrets import AwsSecret
 from pgdesk.catalog import Catalog
 from pgdesk.config import Settings
 
@@ -24,17 +26,37 @@ class Suggestion:
 class SqlAssistant:
     """Own one OpenAI transport for the application, with separate caller-owned histories."""
 
-    def __init__(self, client: AsyncOpenAI | None = None) -> None:
-        """Allow an explicit transport for local protocol smokes; default is direct OpenAI."""
+    def __init__(
+        self,
+        client: AsyncOpenAI | None = None,
+        *,
+        secret: AwsSecret | None = None,
+        key_path: tuple[str, ...] = ("openai_api_key",),
+    ) -> None:
+        """Use explicit AWS credentials when configured; otherwise use OPENAI_API_KEY."""
         self._client = client
+        self._secret = secret
+        self._key_path = key_path
+        self._client_lock = asyncio.Lock()
+
+    async def _get_client(self) -> AsyncOpenAI:
+        """Resolve secrets off-thread and initialize only one transport across concurrent tabs."""
+        async with self._client_lock:
+            if self._client is None:
+                key = (
+                    await asyncio.to_thread(self._secret.text, self._key_path)
+                    if self._secret
+                    else None
+                )
+                self._client = AsyncOpenAI(api_key=key, timeout=120, max_retries=0)
+            return self._client
 
     async def suggest(
         self, settings: Settings, catalog: Catalog, history: list[dict[str, str]], message: str
     ) -> Suggestion:
         """Send the entire tab catalog and conversation, never data outputs or connection details."""
         settings.validate()
-        if self._client is None:
-            self._client = AsyncOpenAI(timeout=120, max_retries=0)
+        client = await self._get_client()
         payload = [
             {"role": "developer", "content": settings.system_prompt},
             {
@@ -53,7 +75,7 @@ class SqlAssistant:
         kwargs = {}
         if settings.reasoning != "default":
             kwargs["reasoning"] = {"effort": settings.reasoning}
-        response = await self._client.responses.create(
+        response = await client.responses.create(
             model=settings.model.strip(),
             input=payload,
             store=False,

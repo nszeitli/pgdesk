@@ -15,3 +15,15 @@
 - [x] Exercise database recovery and query execution scenarios.
 - [x] Launch TUI and verify keyboard-driven workflows.
 - [x] Run focused checks and review all deliverables.
+
+## AWS credential configuration follow-up
+- [x] Locate miscellaneous OpenAI key secret reference.
+- [x] Discover test and production RDS secret shapes.
+- [x] Resolve OpenAI credentials from miscellaneous secret.
+- [x] Add test cluster using blp-test-local.
+- [x] Add production cluster using blp-prod-local.
+- [x] Verify live credentials and read-only connections.
+- [x] Move cluster and secret references into dotenv.
+- [x] Replace obsolete TOML configuration and affected callers.
+- [x] Exercise configured TUI and credential handling tests.
+- [x] Review and commit the verified AWS integration.

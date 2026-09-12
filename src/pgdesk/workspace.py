@@ -380,7 +380,7 @@ class Workspace(Horizontal):
             )
         except OpenAIError:
             log.write(
-                "OpenAI unavailable. Set OPENAI_API_KEY and check connectivity/settings (F9). Request was not retried."
+                "OpenAI unavailable. Check the configured AWS secret or OPENAI_API_KEY and connectivity/settings (F9). Request was not retried."
             )
         except Exception as error:
             log.write(error_text(error))

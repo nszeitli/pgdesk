@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from pgdesk.app import PgDesk
-from pgdesk.config import CONFIG_DIR, load_config
+from pgdesk.config import load_config
 
 
 def main() -> None:
@@ -18,8 +18,8 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=CONFIG_DIR / "config.toml",
-        help="Cluster TOML configuration (default: ~/.config/pgdesk/config.toml)",
+        default=Path(".env"),
+        help="Cluster/credential dotenv configuration (default: .env in the current directory)",
     )
     args = parser.parse_args()
     # Pool warnings include raw endpoints. Health is exposed through sanitized UI status.

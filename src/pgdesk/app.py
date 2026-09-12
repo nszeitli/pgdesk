@@ -67,7 +67,9 @@ class PgDesk(App):
         self.config = config
         self.config_path = config_path
         self.settings = settings or load_settings(config.settings_path)
-        self.assistant = assistant or SqlAssistant()
+        self.assistant = assistant or SqlAssistant(
+            secret=config.openai_secret, key_path=config.openai_key_path
+        )
         self.workspaces: dict[str, Workspace] = {}
         self.serial = 0
         self.quitting = False
@@ -80,7 +82,7 @@ class PgDesk(App):
         )
         yield TabbedContent(id="workspaces")
         yield Static(
-            "PGDesk\n\nCtrl+N  Open a cluster/database workspace\nF9  AI settings     F1  Keyboard reference\n\nIndependent pools · Read-only by default · AI drafts, you execute\n\nConfigure clusters in ~/.config/pgdesk/config.toml\nusing config.example.toml. Credentials stay outside this repo.",
+            "PGDesk\n\nCtrl+N  Open a cluster/database workspace\nF9  AI settings     F1  Keyboard reference\n\nIndependent pools · Read-only by default · AI drafts, you execute\n\nConfigure cluster and AWS secret references in .env\nusing .env.example. Secret values are fetched at runtime.",
             id="welcome",
         )
         yield Footer()
@@ -127,7 +129,7 @@ class PgDesk(App):
             self.config = load_config(self.config_path)
         except (ValueError, TypeError, OSError) as error:
             self.notify(
-                f"Configuration invalid: {type(error).__name__}. Check config.toml.",
+                f"Configuration invalid: {type(error).__name__}. Check {self.config_path}.",
                 severity="error",
             )
             return

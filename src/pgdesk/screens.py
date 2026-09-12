@@ -68,8 +68,8 @@ class ConnectScreen(Dialog):
         self.query_one("#choice-filter", Input).focus()
         if not self.config.clusters:
             self.query_one("#connect-error", Static).update(
-                f"No clusters configured. Create {self.config_path} using config.example.toml, "
-                "then press Ctrl+N again to reload. Use libpq services or DSN environment references."
+                f"No clusters configured. Create {self.config_path} using .env.example, "
+                "then press Ctrl+N again to reload. Use AWS secret, libpq service or DSN environment references."
             )
 
     def rebuild(self) -> None:
@@ -218,7 +218,7 @@ class SettingsScreen(Dialog):
             yield Label("Custom system prompt")
             yield TextArea(self.settings.system_prompt, id="system-prompt", tab_behavior="focus")
             yield Static(
-                "OPENAI_API_KEY is read from your environment. Each message sends this tab's full accessible table/view schema and conversation to OpenAI, never query results. Responses are not stored by this app or requested for server-side storage.",
+                "Credentials come from the configured AWS secret, or OPENAI_API_KEY when no secret is configured. Restart after changing credential references in .env. Each message sends this tab's full accessible table/view schema and conversation to OpenAI, never query results. Responses are not requested for server-side storage.",
                 classes="hint",
             )
             yield Static("", id="settings-error", classes="error", markup=False)
