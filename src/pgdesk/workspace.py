@@ -27,7 +27,7 @@ class Workspace(Horizontal):
 
     DEFAULT_CSS = """
     Workspace { height: 1fr; }
-    Workspace .sidebar { width: 30; min-width: 18; border: round $primary; }
+    Workspace .sidebar { width: 39; min-width: 18; border: round $primary; }
     Workspace .sidebar Input { height: 3; }
     Workspace Tree { height: 1fr; scrollbar-size: 1 1; }
     Workspace .panels { width: 1fr; }
