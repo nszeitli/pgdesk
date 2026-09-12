@@ -21,6 +21,9 @@ from pgdesk.catalog import cell_text
 from pgdesk.screens import Dialog
 from pgdesk.themes import editor_theme
 
+# Highlighting is synchronous; cap decoration work, never the retained cell text.
+MAX_HIGHLIGHT_CHARACTERS = 200_000
+
 
 def export_value(path: Path, text: str) -> None:
     """Create an owner-only UTF-8 value file without replacing any existing destination."""
@@ -78,6 +81,7 @@ class ValueInspector(Dialog):
 
     def compose(self) -> ComposeResult:
         """Keep view, search, clipboard and explicit export destination keyboard accessible."""
+        text = self.value_text()
         with Vertical():
             yield Static(Text(f"Cell detail · row {self.row + 1} · {self.column} · Escape closes"))
             yield Static(
@@ -103,8 +107,10 @@ class ValueInspector(Dialog):
                 yield Button("Previous", id="inspect-previous")
                 yield Button("Next", id="inspect-next")
             yield TextArea(
-                self.value_text(),
-                language="json" if self.structured else None,
+                text,
+                language="json"
+                if self.structured and len(text) <= MAX_HIGHLIGHT_CHARACTERS
+                else None,
                 read_only=True,
                 show_line_numbers=True,
                 soft_wrap=False,
