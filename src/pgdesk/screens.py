@@ -360,6 +360,12 @@ If ordering is expensive, an unordered sample is explicitly marked NOT LATEST.
 Views, foreign tables and expensive sample plans require explicit manual SQL/F5.
 Duplicating copies selection, SQL and prompt context, not results or active work.
 All buttons, lists, tabs and table cells are keyboard navigable.
+Enter / click on a result cell opens retained-value detail: pretty/raw text,
+collapsible JSON tree, Ctrl+F search, F3/Shift+F3 next/previous match,
+Ctrl+Y copy all (terminal clipboard support required), Ctrl+S export to an
+explicit file without overwriting. Escape closes. Tree labels abbreviate long
+leaves; switch to pretty/raw to read or search their full text. Light results
+may contain capped text/NULL flags: close and use Ctrl+G before inspecting full values.
 Run commits on success, rolls back on failure. No manual transaction,
 SET/RESET or COPY session state; pooled runs are isolated. A lost connection
 near commit has an uncertain outcome: inspect before rerunning writes.

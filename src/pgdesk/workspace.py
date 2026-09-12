@@ -8,7 +8,7 @@ from typing import Any
 
 from openai import APIStatusError, OpenAIError
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, DataTable, Input, Label, Static, TextArea, Tree
@@ -18,8 +18,21 @@ from pgdesk.browsing import BrowsePlan
 from pgdesk.catalog import Catalog, QueryResult, Relation, cell_text
 from pgdesk.config import Cluster, Config
 from pgdesk.database import DatabaseSession, error_text
+from pgdesk.inspector import ValueInspector
 from pgdesk.screens import ConfirmScreen, ExportScreen
 from pgdesk.themes import editor_theme
+
+
+class ResultTable(DataTable):
+    """Select data cells on the first click, not only a second click on the cursor."""
+
+    async def _on_click(self, event: events.Click) -> None:
+        """Keep native header/scroll handling and emit exactly one selection for any data click."""
+        before = self.cursor_coordinate
+        await super()._on_click(event)
+        event.prevent_default()
+        if self.cursor_coordinate != before:
+            self.action_select_cursor()
 
 
 class Workspace(Horizontal):
@@ -56,6 +69,7 @@ class Workspace(Horizontal):
         self.session = DatabaseSession(cluster, database, config)
         self.catalog_snapshot: Catalog | None = None
         self.result: QueryResult | None = None
+        self._result_is_light = False
         self.selected_relation: Relation | None = None
         self._generated_sql = ""
         self._selection_generation = 0
@@ -109,7 +123,7 @@ class Workspace(Horizontal):
                     )
             with Vertical(id="data-panel", classes="work-panel"):
                 yield Label(
-                    " RESULTS · Ctrl+L light 100 · Ctrl+G heavy 100 · F4 focuses",
+                    " RESULTS · Enter/click inspects · Ctrl+L light 100 · Ctrl+G heavy 100",
                     classes="panel-title",
                 )
                 yield Static(
@@ -118,7 +132,7 @@ class Workspace(Horizontal):
                     classes="result-status",
                     markup=False,
                 )
-                yield DataTable(id="results", zebra_stripes=True, cursor_type="cell")
+                yield ResultTable(id="results", zebra_stripes=True, cursor_type="cell")
             yield Static("F2 AI · F3 SQL · F4 Results", classes="empty-panels", id="empty-panels")
 
     def on_mount(self) -> None:
@@ -418,6 +432,7 @@ class Workspace(Horizontal):
                 if heavy
                 else "LIGHT · text capped at 160; large fields show __is_null"
             )
+            self._result_is_light = not heavy
             await self._publish_result(
                 preview.result, f"{provenance} · {projection} · ", generation
             )
@@ -465,6 +480,7 @@ class Workspace(Horizontal):
     def _begin_result(self, status: str) -> None:
         """Remove stale rows and disable Run while one operation owns the result surface."""
         self.result = None
+        self._result_is_light = False
         self.query_one("#results", DataTable).clear(columns=True)
         self.query_one("#run", Button).disabled = True
         self.set_status(status)
@@ -498,6 +514,22 @@ class Workspace(Horizontal):
         )
         self.set_status(
             f"{prefix}{result.status} · {result.elapsed:.3f}s · {len(result.rows):,} rows{suffix}"
+        )
+
+    @on(DataTable.CellSelected, "#results")
+    def inspect_cell(self, event: DataTable.CellSelected) -> None:
+        """Open the retained cell, never its clipped DataTable rendering or a fresh SQL query."""
+        event.stop()
+        result = self.result
+        row, column = event.coordinate
+        if result is None or not (
+            0 <= row < len(result.rows) and 0 <= column < len(result.columns)
+        ):
+            return
+        self.app.push_screen(
+            ValueInspector(
+                result.columns[column], row, result.rows[row][column], light=self._result_is_light
+            )
         )
 
     async def cancel_query(self) -> None:

@@ -46,3 +46,10 @@
 - [x] Update affected help and commit verified features.
 - [x] Add settings theme selector with every Oracle TUI theme.
 - [x] Recommend detailed inspection for large structured values.
+
+## Retained-cell inspector
+- [x] Add searchable full-value JSON and text inspector.
+- [x] Open inspector with Enter and first data-cell click.
+- [x] Support whole-value copy and exclusive file export.
+- [x] Exercise retained values and light-preview boundaries.
+- [x] Verify and commit the completed inspector.
