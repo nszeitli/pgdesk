@@ -7,7 +7,15 @@ import logging
 from pathlib import Path
 
 from pgdesk.app import PgDesk
-from pgdesk.config import load_config
+from pgdesk.config import CONFIG_DIR, load_config
+
+
+def _default_config_path() -> Path:
+    """Anchor editable installs to their repository and wheel installs to user configuration."""
+    package_parent = Path(__file__).resolve().parent.parent
+    if package_parent.name == "src":
+        return package_parent.parent / ".env"
+    return CONFIG_DIR / ".env"
 
 
 def main() -> None:
@@ -18,8 +26,8 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(".env"),
-        help="Cluster/credential dotenv configuration (default: .env in the current directory)",
+        default=_default_config_path(),
+        help="Cluster/credential dotenv configuration (default: %(default)s)",
     )
     args = parser.parse_args()
     # Pool warnings include raw endpoints. Health is exposed through sanitized UI status.

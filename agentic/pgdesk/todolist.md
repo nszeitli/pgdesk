@@ -27,3 +27,8 @@
 - [x] Replace obsolete TOML configuration and affected callers.
 - [x] Exercise configured TUI and credential handling tests.
 - [x] Review and commit the verified AWS integration.
+
+## Configuration portability correction
+- [x] Make default dotenv resolution independent of cwd.
+- [x] Remove account references from committed configuration example.
+- [x] Verify installed CLI configuration portability and commit.

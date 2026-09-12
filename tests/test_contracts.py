@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import pgdesk.__main__ as entrypoint
 from pgdesk.catalog import QueryResult, Relation
 from pgdesk.config import Settings, load_config, load_settings, save_settings
 
@@ -42,6 +43,26 @@ def test_dotenv_references_do_not_inherit_or_mutate_process_configuration(
     config = load_config(path)
     assert config.clusters[0].aws_secret.secret_id != os.environ["UNRELATED_SECRET_NAME"]
     assert os.environ["PGDESK_CLUSTERS"] == "ambient"
+
+
+@pytest.mark.parametrize("layout", ["repo/src", "venv/site-packages"])
+def test_default_config_is_anchored_to_installation_not_launch_directory(
+    tmp_path: Path, monkeypatch, layout: str
+) -> None:
+    """Launching from another project cannot select that project's unrelated credentials."""
+    package_parent = tmp_path / layout
+    monkeypatch.setattr(entrypoint, "__file__", str(package_parent / "pgdesk" / "__main__.py"))
+    monkeypatch.setattr(entrypoint, "CONFIG_DIR", tmp_path / "user-config")
+    expected = (
+        package_parent.parent / ".env"
+        if layout == "repo/src"
+        else tmp_path / "user-config" / ".env"
+    )
+    elsewhere = tmp_path / "unrelated-project"
+    elsewhere.mkdir()
+    (elsewhere / ".env").write_text("PGDESK_CLUSTERS=unrelated\n")
+    monkeypatch.chdir(elsewhere)
+    assert entrypoint._default_config_path() == expected
 
 
 def test_bad_settings_do_not_replace_last_working_preferences(tmp_path: Path) -> None:
