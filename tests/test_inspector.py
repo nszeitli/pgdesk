@@ -5,8 +5,9 @@ import stat
 from pathlib import Path
 
 import pytest
+from textual.widgets import Tree
 
-from pgdesk.inspector import ValueInspector, export_value
+from pgdesk.inspector import MAX_TREE_CHILDREN, ValueInspector, export_value
 
 
 def test_json_views_preserve_nested_values_beyond_grid_clipping() -> None:
@@ -28,3 +29,17 @@ def test_export_preserves_text_and_never_overwrites(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         export_value(path, "replacement")
     assert path.read_bytes() == text.encode("utf-8")
+
+
+@pytest.mark.parametrize("as_object", [False, True])
+def test_wide_tree_expansion_is_bounded_without_truncating_value(as_object: bool) -> None:
+    """Wide arrays/objects cannot allocate an unbounded branch or lose omitted data on copy."""
+    entries = list(range(MAX_TREE_CHILDREN + 2))
+    value = {str(i): i for i in entries} if as_object else entries
+    inspector = ValueInspector("payload", 0, value)
+    tree = Tree("$", data=value)
+    inspector._populate(tree.root)
+    assert len(tree.root.children) == MAX_TREE_CHILDREN + 1
+    inspector._populate(tree.root)
+    assert len(tree.root.children) == MAX_TREE_CHILDREN + 1
+    assert json.loads(inspector.value_text("tree")) == value

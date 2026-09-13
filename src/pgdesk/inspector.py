@@ -23,6 +23,7 @@ from pgdesk.themes import editor_theme
 
 # Highlighting is synchronous; cap decoration work, never the retained cell text.
 MAX_HIGHLIGHT_CHARACTERS = 200_000
+MAX_TREE_CHILDREN = 1_000
 
 
 def export_value(path: Path, text: str) -> None:
@@ -140,7 +141,7 @@ class ValueInspector(Dialog):
         editor.focus()
 
     def _populate(self, node: TreeNode) -> None:
-        """Materialize one level without recursively allocating widgets for the entire payload."""
+        """Bound each expansion; overflow remains available in complete pretty/raw text."""
         if node.id in self._populated:
             return
         self._populated.add(node.id)
@@ -152,7 +153,14 @@ class ValueInspector(Dialog):
             if isinstance(value, list)
             else ()
         )
-        for key, child in entries:
+        for index, (key, child) in enumerate(entries):
+            if index == MAX_TREE_CHILDREN:
+                node.add_leaf(
+                    Text(
+                        f"… {len(value) - MAX_TREE_CHILDREN:,} more entries · use Pretty/Raw or Ctrl+F"
+                    )
+                )
+                break
             name = json.dumps(key, ensure_ascii=False)
             if isinstance(child, (dict, list)) and child:
                 kind = "object" if isinstance(child, dict) else "array"
